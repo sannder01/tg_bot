@@ -111,7 +111,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         elif cmd == "list":
             items = db.get("shopping", {}).get(chat_id, [])
             if not items:
-                reply = "🛒 Список пуст. Напиши /add молоко"
+                reply = "🛒 Список пуст. Напиши /add"
             else:
                 lines = ["🛒 *Список покупок:*\n"]
                 for i, it in enumerate(items, 1):
@@ -179,6 +179,31 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             else:
                 reply = "💬 Цитат пока нет."
 
+
+
+
+
+
+
+
+        # /ai вопрос
+        elif cmd == "ai" and args:
+            if not groq_client:
+                reply = "⚠️ ИИ не настроен"
+            else:
+                user_msg = " ".join(args)
+                try:
+                    response = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": "Ты дружелюбный ассистент. Отвечай коротко с юмором. Отвечай на языке пользователя."},
+                            {"role": "user", "content": user_msg}
+                        ],
+                        max_tokens=500,
+                    )
+                    reply = f"🤖 {response.choices[0].message.content}"
+                except Exception as e:
+                    reply = "❌ ИИ недоступен. Попробуй позже."
         # /stop — отключить ИИ
         elif cmd == "stop":
             db.setdefault("ai_enabled", {})[chat_id] = False
@@ -194,13 +219,13 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         elif cmd == "help":
             reply = (
                 "📋 *Команды для чата:*\n\n"
-                "/add молоко — добавить покупку\n"
+                "/add - добавить покупку\n"
                 "/list — список покупок\n"
                 "/bought 1 — вычеркнуть\n\n"
-                "/wish AirPods — добавить в вишлист\n"
+                "/wish — добавить в вишлист\n"
                 "/wishlist — показать вишлист\n"
                 "/done 1 — исполнено\n\n"
-                "/check текст — детектор лжи\n"
+                "/check — детектор лжи\n"
                 "/quote — случайная цитата\n\n"
                 "/stop — отключить автоответ ИИ\n"
                 "/resume — включить автоответ ИИ"
