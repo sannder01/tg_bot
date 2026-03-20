@@ -8,7 +8,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
-    BusinessMessageHandler
+    TypeHandler
 )
 
 load_dotenv()
@@ -57,11 +57,15 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         logger.warning("Groq не настроен — автоответ не работает")
         return
 
-    message = update.business_message
+    # Получаем business сообщение из raw update
+    try:
+        message = update.business_message
+    except AttributeError:
+        return
+
     if not message or not message.text:
         return
 
-    # Не отвечаем на свои собственные сообщения
     if message.from_user and message.from_user.is_bot:
         return
 
@@ -380,8 +384,8 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # 📨 Business автоответ — главная фича
-    app.add_handler(BusinessMessageHandler(handle_business_message))
+    # 📨 Business автоответ — ловим все апдейты и проверяем внутри
+    app.add_handler(TypeHandler(Update, handle_business_message), group=-1)
 
     # Обычные команды (в личке с ботом)
     app.add_handler(CommandHandler("start", start))
