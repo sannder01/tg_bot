@@ -67,7 +67,18 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if message.from_user and message.from_user.is_bot:
-        return
+    return
+
+    # Не отвечаем на свои собственные сообщения
+    if update.business_message.business_connection_id:
+        try:
+            connection = await context.bot.get_business_connection(
+                update.business_message.business_connection_id
+            )
+            if message.from_user and connection.user.id == message.from_user.id:
+                return
+        except Exception:
+            pass
 
     sender_name = message.from_user.first_name if message.from_user else "Собеседник"
     chat_id = str(message.chat.id)
