@@ -67,24 +67,32 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     if message.from_user and message.from_user.is_bot:
         return
 
+    
+    sender_name = message.from_user.first_name if message.from_user else "Собеседник"
+    chat_id = str(message.chat.id)
+    user_text = message.text
+
     # Не отвечаем на сообщения владельца аккаунта
+    # Если это владелец — только команды, не ИИ
+    is_owner = False
     if update.business_message.business_connection_id:
         try:
             connection = await context.bot.get_business_connection(
                 update.business_message.business_connection_id
             )
             if message.from_user and connection.user.id == message.from_user.id:
-                return
+                is_owner = True
         except Exception:
             pass
+
+    # Владелец пишет обычное сообщение — игнорируем
+    if is_owner and not user_text.startswith("/"):
+        return
 
     if not groq_client:
         return
 
-    sender_name = message.from_user.first_name if message.from_user else "Собеседник"
-    chat_id = str(message.chat.id)
-    user_text = message.text
-
+    
     # ── Обработка команд из бизнес-чата ──────────────────────────────────────
     if user_text.startswith("/"):
         cmd = user_text.split()[0].lower().replace("/", "")
