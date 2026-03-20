@@ -173,15 +173,14 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 
         # /stop — отключить ИИ
         elif cmd == "stop":
-            db.setdefault("ai_disabled", {})[chat_id] = True
+            db.setdefault("ai_enabled", {})[chat_id] = False
             save_db(db)
-            reply = "🔇 Автоответ ИИ отключён. Команды всё ещё работают.\nНапиши /resume чтобы включить обратно."
+            reply = "🔇 Автоответ ИИ отключён. Команды работают.\nНапиши /resume чтобы включить."
 
-        # /resume — включить ИИ
         elif cmd == "resume":
-            db.setdefault("ai_disabled", {})[chat_id] = False
+            db.setdefault("ai_enabled", {})[chat_id] = True
             save_db(db)
-            reply = "🔊 Автоответ ИИ снова включён!"
+            reply = "🔊 Автоответ ИИ включён!"
 
         # /help
         elif cmd == "help":
