@@ -216,7 +216,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     db = load_db()
 
     # Проверяем не отключён ли ИИ
-    if db.get("ai_disabled", {}).get(chat_id):
+    if not db.get("ai_enabled", {}).get(chat_id):
         return
 
     db.setdefault("business_history", {}).setdefault(chat_id, [])
