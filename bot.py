@@ -37,9 +37,7 @@ AUTO_REPLY_SYSTEM_PROMPT = os.getenv("BOT_PERSONA", (
 # ─── Настройки дедлайнов ──────────────────────────────────────────────────
 ICAL_URL = os.getenv(
     "ICAL_URL",
-    "https://lms.astanait.edu.kz/calendar/export_execute.php"
-    "?userid=17634&authtoken=3f6f62339ece52c531c9dbffe568d0eacd33444f"
-    "&preset_what=all&preset_time=recentupcoming"
+    "https://lms.astanait.edu.kz/calendar/export_execute.php?userid=17634&authtoken=3f6f62339ece52c531c9dbffe568d0eacd33444f&preset_what=courses&preset_time=recentupcoming"
 )
 DEADLINE_CHAT_ID = os.getenv("DEADLINE_CHAT_ID", "")
 DEADLINE_HOUR    = int(os.getenv("DEADLINE_HOUR",   "8"))
