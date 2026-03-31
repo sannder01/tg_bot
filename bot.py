@@ -1,9 +1,14 @@
 import os
+import re
 import json
 import random
 import logging
+import pytz
+from datetime import datetime, timedelta, timezone
+from urllib.request import urlopen, Request
 from groq import Groq
 from dotenv import load_dotenv
+from icalendar import Calendar
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler,
@@ -29,6 +34,20 @@ AUTO_REPLY_SYSTEM_PROMPT = os.getenv("BOT_PERSONA", (
     "Отвечай на языке собеседника."
 ))
 
+# ─── Настройки дедлайнов ──────────────────────────────────────────────────
+ICAL_URL = os.getenv(
+    "ICAL_URL",
+    "https://lms.astanait.edu.kz/calendar/export_execute.php"
+    "?userid=17634&authtoken=3f6f62339ece52c531c9dbffe568d0eacd33444f"
+    "&preset_what=all&preset_time=recentupcoming"
+)
+DEADLINE_CHAT_ID = os.getenv("DEADLINE_CHAT_ID", "")
+DEADLINE_HOUR    = int(os.getenv("DEADLINE_HOUR",   "8"))
+DEADLINE_MINUTE  = int(os.getenv("DEADLINE_MINUTE", "0"))
+DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
+DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
+
+# ─── База данных ──────────────────────────────────────────────────────────
 DB_FILE = "data.json"
 
 def load_db() -> dict:
@@ -52,6 +71,155 @@ def get_chat_key(update: Update) -> str:
     return str(update.effective_chat.id)
 
 # ════════════════════════════════════════════════════════════════════════════
+#  📚  ДЕДЛАЙНЫ
+# ════════════════════════════════════════════════════════════════════════════
+
+def escape_md(text: str) -> str:
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def parse_course(component) -> str:
+    categories = str(component.get("CATEGORIES", ""))
+    if categories and categories not in ("None", ""):
+        return categories.strip()
+    description = str(component.get("DESCRIPTION", ""))
+    match = re.search(r"Course[:\s]+(.+)", description, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    summary = str(component.get("SUMMARY", ""))
+    match = re.search(r"\((.+?)\)\s*$", summary)
+    if match:
+        return match.group(1).strip()
+    return "Неизвестный предмет"
+
+
+def fetch_deadlines() -> list:
+    logger.info("Загружаю календарь...")
+    req = Request(ICAL_URL, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    })
+    with urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+
+    tz_obj = pytz.timezone(DEADLINE_TZ)
+    cal    = Calendar.from_ical(raw)
+    now    = datetime.now(tz_obj)
+    limit  = now + timedelta(days=DAYS_AHEAD)
+    events = []
+
+    for component in cal.walk():
+        if component.name != "VEVENT":
+            continue
+        dtstart = component.get("DTSTART")
+        if dtstart is None:
+            continue
+        dt = dtstart.dt
+        if not isinstance(dt, datetime):
+            dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = tz_obj.localize(dt)
+        else:
+            dt = dt.astimezone(tz_obj)
+        if now <= dt <= limit:
+            events.append({
+                "title":  str(component.get("SUMMARY", "(без названия)")),
+                "course": parse_course(component),
+                "dt":     dt,
+                "url":    str(component.get("URL", "")),
+            })
+
+    events.sort(key=lambda e: e["dt"])
+    return events
+
+
+def build_deadline_message(events: list) -> str:
+    tz_obj  = pytz.timezone(DEADLINE_TZ)
+    now     = datetime.now(tz_obj)
+    now_str = escape_md(now.strftime("%d.%m.%Y %H:%M"))
+
+    if not events:
+        return (
+            "✅ *Дедлайнов нет\\!*\n"
+            "На ближайшие " + str(DAYS_AHEAD) + " дней ничего нет\\.\n"
+            "_Обновлено: " + now_str + "_"
+        )
+
+    lines = [
+        "📚 *Дедлайны на ближайшие " + str(DAYS_AHEAD) + " дней*",
+        "_Обновлено: " + now_str + "_\n",
+    ]
+
+    for e in events:
+        delta = e["dt"] - now
+        days  = delta.days
+        hours = delta.seconds // 3600
+
+        if days == 0:
+            left = "⚠️ сегодня, через " + str(hours) + "ч"
+        elif days == 1:
+            left = "🔶 завтра"
+        elif days <= 3:
+            left = "🟡 через " + str(days) + " д\\."
+        else:
+            left = "🟢 через " + str(days) + " д\\."
+
+        date_str = escape_md(e["dt"].strftime("%d.%m %H:%M"))
+        title    = escape_md(e["title"])
+        course   = escape_md(e["course"])
+
+        line = (
+            left + " — *" + title + "*\n"
+            "    📖 " + course + "\n"
+            "    📅 " + date_str
+        )
+        if e["url"] and e["url"] != "None":
+            line += "\n    🔗 [Открыть](" + e["url"] + ")"
+        lines.append(line)
+
+    return "\n\n".join(lines)
+
+
+async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /deadlines — показать дедлайны прямо сейчас."""
+    msg = await update.message.reply_text("⏳ Загружаю дедлайны...")
+    try:
+        events  = fetch_deadlines()
+        message = build_deadline_message(events)
+        await msg.edit_text(message, parse_mode="MarkdownV2", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error("Ошибка дедлайнов: %s", e)
+        await msg.edit_text("❌ Не удалось загрузить дедлайны:\n<code>" + str(e) + "</code>", parse_mode="HTML")
+
+
+async def daily_deadlines_job(context):
+    """Ежедневная задача — отправить дедлайны."""
+    if not DEADLINE_CHAT_ID:
+        return
+    try:
+        events  = fetch_deadlines()
+        message = build_deadline_message(events)
+        await context.bot.send_message(
+            chat_id=DEADLINE_CHAT_ID,
+            text=message,
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+        logger.info("Дедлайны отправлены (%d событий)", len(events))
+    except Exception as e:
+        logger.error("Ошибка daily_deadlines_job: %s", e)
+        await context.bot.send_message(
+            chat_id=DEADLINE_CHAT_ID,
+            text="❌ Не удалось загрузить дедлайны:\n<code>" + str(e) + "</code>",
+            parse_mode="HTML",
+        )
+
+# ════════════════════════════════════════════════════════════════════════════
 #  🤖  BUSINESS — автоответ + команды в чате
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -67,13 +235,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     if message.from_user and message.from_user.is_bot:
         return
 
-    
     sender_name = message.from_user.first_name if message.from_user else "Собеседник"
     chat_id = str(message.chat.id)
     user_text = message.text
 
-    # Не отвечаем на сообщения владельца аккаунта
-    # Если это владелец — только команды, не ИИ
     is_owner = False
     if update.business_message.business_connection_id:
         try:
@@ -85,29 +250,25 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-    # Владелец пишет обычное сообщение — игнорируем
     if is_owner and not user_text.startswith("/"):
         return
 
     if not groq_client:
         return
 
-    
-    # ── Обработка команд из бизнес-чата ──────────────────────────────────────
+    # ── Обработка команд из бизнес-чата ─────────────────────────────────────
     if user_text.startswith("/"):
         cmd = user_text.split()[0].lower().replace("/", "")
         args = user_text.split()[1:]
         db = load_db()
 
-        # /add товар
         if cmd == "add" and args:
             item = " ".join(args)
             db.setdefault("shopping", {}).setdefault(chat_id, [])
             db["shopping"][chat_id].append({"name": item, "done": False, "by": sender_name})
             save_db(db)
-            reply = f"✅ *{item}* добавлен в список покупок!"
+            reply = "✅ *" + item + "* добавлен в список покупок!"
 
-        # /list
         elif cmd == "list":
             items = db.get("shopping", {}).get(chat_id, [])
             if not items:
@@ -116,29 +277,26 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 lines = ["🛒 *Список покупок:*\n"]
                 for i, it in enumerate(items, 1):
                     icon = "✅" if it["done"] else "◻️"
-                    lines.append(f"{icon} {i}. {it['name']} _({it['by']})_")
+                    lines.append(icon + " " + str(i) + ". " + it["name"] + " _(" + it["by"] + ")_")
                 reply = "\n".join(lines)
 
-        # /bought номер
         elif cmd == "bought" and args and args[0].isdigit():
             items = db.get("shopping", {}).get(chat_id, [])
             idx = int(args[0]) - 1
             if 0 <= idx < len(items):
                 items[idx]["done"] = True
                 save_db(db)
-                reply = f"✅ *{items[idx]['name']}* куплен!"
+                reply = "✅ *" + items[idx]["name"] + "* куплен!"
             else:
                 reply = "❌ Нет такого номера."
 
-        # /wish желание
         elif cmd == "wish" and args:
             wish = " ".join(args)
             db.setdefault("wishlist", {}).setdefault(chat_id, [])
             db["wishlist"][chat_id].append({"name": wish, "done": False, "by": sender_name})
             save_db(db)
-            reply = f"⭐ *{wish}* добавлен в вишлист!"
+            reply = "⭐ *" + wish + "* добавлен в вишлист!"
 
-        # /wishlist
         elif cmd == "wishlist":
             items = db.get("wishlist", {}).get(chat_id, [])
             if not items:
@@ -147,46 +305,55 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 lines = ["🎯 *Вишлист:*\n"]
                 for i, it in enumerate(items, 1):
                     icon = "✅" if it["done"] else "⭐"
-                    lines.append(f"{icon} {i}. {it['name']} _({it['by']})_")
+                    lines.append(icon + " " + str(i) + ". " + it["name"] + " _(" + it["by"] + ")_")
                 reply = "\n".join(lines)
 
-        # /done номер
         elif cmd == "done" and args and args[0].isdigit():
             items = db.get("wishlist", {}).get(chat_id, [])
             idx = int(args[0]) - 1
             if 0 <= idx < len(items):
                 items[idx]["done"] = True
                 save_db(db)
-                reply = f"🎉 *{items[idx]['name']}* исполнено!"
+                reply = "🎉 *" + items[idx]["name"] + "* исполнено!"
             else:
                 reply = "❌ Нет такого номера."
 
-        # /check текст
         elif cmd == "check":
             claim = " ".join(args) if args else "это"
             pct = random.randint(0, 100)
             bar = "🟩" * (pct // 10) + "⬜" * (10 - pct // 10)
             verdicts = ["🤥 Наглая ЛОЖЬ!", "😬 Скорее врёт...", "🤔 Сомнительно", "✅ Чистая правда!"]
             verdict = verdicts[min(pct // 25, 3)]
-            reply = f"🕵️ *Детектор лжи*\n\n_{claim}_\n\n📊 {pct}%\n{bar}\n\n{verdict}"
+            reply = "🕵️ *Детектор лжи*\n\n_" + claim + "_\n\n📊 " + str(pct) + "%\n" + bar + "\n\n" + verdict
 
-        # /quote
         elif cmd == "quote":
             quotes = db.get("quotes", {}).get(chat_id, [])
             if quotes:
                 q = random.choice(quotes)
-                reply = f"💬 _«{q['text']}»_\n\n— {q['by']}"
+                reply = "💬 _«" + q["text"] + "»_\n\n— " + q["by"]
             else:
                 reply = "💬 Цитат пока нет."
 
+        elif cmd == "deadlines":
+            try:
+                events  = fetch_deadlines()
+                reply_md = build_deadline_message(events)
+                await context.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=reply_md,
+                    parse_mode="MarkdownV2",
+                    disable_web_page_preview=True,
+                    business_connection_id=message.business_connection_id
+                )
+            except Exception as e:
+                await context.bot.send_message(
+                    chat_id=message.chat.id,
+                    text="❌ Не удалось загрузить дедлайны:\n<code>" + str(e) + "</code>",
+                    parse_mode="HTML",
+                    business_connection_id=message.business_connection_id
+                )
+            return
 
-
-
-
-
-
-
-        # /ai вопрос
         elif cmd == "ai" and args:
             if not groq_client:
                 reply = "⚠️ ИИ не настроен"
@@ -201,10 +368,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                         ],
                         max_tokens=500,
                     )
-                    reply = f"🤖 {response.choices[0].message.content}"
-                except Exception as e:
+                    reply = "🤖 " + response.choices[0].message.content
+                except Exception:
                     reply = "❌ ИИ недоступен. Попробуй позже."
-        # /stop — отключить ИИ
+
         elif cmd == "stop":
             db.setdefault("ai_enabled", {})[chat_id] = False
             save_db(db)
@@ -215,11 +382,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             save_db(db)
             reply = "🔊 Автоответ ИИ включён!"
 
-        # /help
         elif cmd == "help":
             reply = (
                 "📋 *Команды для чата:*\n\n"
-                "/add - добавить покупку\n"
+                "/add — добавить покупку\n"
                 "/list — список покупок\n"
                 "/bought 1 — вычеркнуть\n\n"
                 "/wish — добавить в вишлист\n"
@@ -227,6 +393,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 "/done 1 — исполнено\n\n"
                 "/check — детектор лжи\n"
                 "/quote — случайная цитата\n\n"
+                "/deadlines — дедлайны AITU LMS\n\n"
                 "/stop — отключить автоответ ИИ\n"
                 "/resume — включить автоответ ИИ"
             )
@@ -242,19 +409,18 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 business_connection_id=message.business_connection_id
             )
         except Exception as e:
-            logger.error(f"Ошибка отправки команды: {e}")
+            logger.error("Ошибка отправки команды: %s", e)
         return
 
-    # ── Обычное сообщение — отвечает ИИ ──────────────────────────────────────
+    # ── Обычное сообщение — отвечает ИИ ─────────────────────────────────────
     db = load_db()
 
-    # Проверяем не отключён ли ИИ
     if not db.get("ai_enabled", {}).get(chat_id):
         return
 
     db.setdefault("business_history", {}).setdefault(chat_id, [])
     history = db["business_history"][chat_id]
-    history.append({"role": "user", "content": f"{sender_name}: {user_text}"})
+    history.append({"role": "user", "content": sender_name + ": " + user_text})
     if len(history) > 10:
         history = history[-10:]
 
@@ -271,27 +437,30 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         history.append({"role": "assistant", "content": reply})
         db["business_history"][chat_id] = history
         save_db(db)
-
         await context.bot.send_message(
             chat_id=message.chat.id,
             text=reply,
             business_connection_id=message.business_connection_id
         )
-        logger.info(f"Автоответ для {sender_name}: {reply[:50]}")
+        logger.info("Автоответ для %s: %s...", sender_name, reply[:50])
     except Exception as e:
-        logger.error(f"Ошибка автоответа: {e}")
+        logger.error("Ошибка автоответа: %s", e)
 
 # ════════════════════════════════════════════════════════════════════════════
-#  /start — управление ботом в личке с ботом
+#  /start
 # ════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai = "✅ Подключён (Llama 3)" if groq_client else "❌ Нет GROQ_API_KEY"
+    dl = ("✅ " + DEADLINE_CHAT_ID) if DEADLINE_CHAT_ID else "⚠️ не задан DEADLINE_CHAT_ID"
     await update.message.reply_text(
-        f"👋 Привет! Я твой Business-бот.\n"
-        f"🤖 ИИ: {ai}\n\n"
+        "👋 Привет! Я твой Business-бот.\n"
+        "🤖 ИИ: " + ai + "\n\n"
         "📨 *Автоответ:*\n"
         "  Подключи в Настройки → Business → Чат-боты\n\n"
+        "📚 *Дедлайны AITU LMS:*\n"
+        "  /deadlines — показать прямо сейчас\n"
+        "  _(авторассылка в " + str(DEADLINE_HOUR) + ":00 → " + dl + ")_\n\n"
         "🛒 /add молоко — добавить покупку\n"
         "📋 /list — список покупок\n"
         "✅ /bought 1 — вычеркнуть\n\n"
@@ -322,19 +491,19 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/persona Отвечай дружелюбно с юмором"
         )
     AUTO_REPLY_SYSTEM_PROMPT = " ".join(context.args)
-    await update.message.reply_text(f"✅ Стиль обновлён:\n\n_{AUTO_REPLY_SYSTEM_PROMPT}_", parse_mode="Markdown")
+    await update.message.reply_text("✅ Стиль обновлён:\n\n_" + AUTO_REPLY_SYSTEM_PROMPT + "_", parse_mode="Markdown")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai = "✅ Подключён" if groq_client else "❌ Не настроен"
     await update.message.reply_text(
-        f"⚙️ *Статус:*\n\n"
-        f"🤖 ИИ: {ai}\n"
-        f"📝 Стиль:\n_{AUTO_REPLY_SYSTEM_PROMPT}_",
+        "⚙️ *Статус:*\n\n"
+        "🤖 ИИ: " + ai + "\n"
+        "📝 Стиль:\n_" + AUTO_REPLY_SYSTEM_PROMPT + "_",
         parse_mode="Markdown"
     )
 
 # ════════════════════════════════════════════════════════════════════════════
-#  🛒  СПИСОК ПОКУПОК (команды в личке с ботом)
+#  🛒  СПИСОК ПОКУПОК
 # ════════════════════════════════════════════════════════════════════════════
 
 async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,7 +515,7 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item = " ".join(context.args)
     db["shopping"][key].append({"name": item, "done": False, "by": update.effective_user.first_name})
     save_db(db)
-    await update.message.reply_text(f"✅ *{item}* добавлен!", parse_mode="Markdown")
+    await update.message.reply_text("✅ *" + item + "* добавлен!", parse_mode="Markdown")
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_chat_key(update)
@@ -357,8 +526,8 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["🛒 *Список покупок:*\n"]
     for i, it in enumerate(items, 1):
         icon = "✅" if it["done"] else "◻️"
-        lines.append(f"{icon} {i}. {it['name']} _({it['by']})_")
-    keyboard = [[InlineKeyboardButton("🗑 Очистить", callback_data=f"clear_shop_{key}")]]
+        lines.append(icon + " " + str(i) + ". " + it["name"] + " _(" + it["by"] + ")_")
+    keyboard = [[InlineKeyboardButton("🗑 Очистить", callback_data="clear_shop_" + key)]]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def bought_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +540,7 @@ async def bought_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 0 <= idx < len(items):
         items[idx]["done"] = True
         save_db(db)
-        await update.message.reply_text(f"✅ *{items[idx]['name']}* куплен!", parse_mode="Markdown")
+        await update.message.reply_text("✅ *" + items[idx]["name"] + "* куплен!", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Нет такого номера.")
 
@@ -388,7 +557,7 @@ async def add_wish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wish = " ".join(context.args)
     db["wishlist"][key].append({"name": wish, "done": False, "by": update.effective_user.first_name})
     save_db(db)
-    await update.message.reply_text(f"⭐ *{wish}* добавлен!", parse_mode="Markdown")
+    await update.message.reply_text("⭐ *" + wish + "* добавлен!", parse_mode="Markdown")
 
 async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_chat_key(update)
@@ -399,8 +568,8 @@ async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["🎯 *Вишлист:*\n"]
     for i, it in enumerate(items, 1):
         icon = "✅" if it["done"] else "⭐"
-        lines.append(f"{icon} {i}. {it['name']} _({it['by']})_")
-    keyboard = [[InlineKeyboardButton("🗑 Очистить", callback_data=f"clear_wish_{key}")]]
+        lines.append(icon + " " + str(i) + ". " + it["name"] + " _(" + it["by"] + ")_")
+    keyboard = [[InlineKeyboardButton("🗑 Очистить", callback_data="clear_wish_" + key)]]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def done_wish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,7 +582,7 @@ async def done_wish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 0 <= idx < len(items):
         items[idx]["done"] = True
         save_db(db)
-        await update.message.reply_text(f"🎉 *{items[idx]['name']}* исполнено!", parse_mode="Markdown")
+        await update.message.reply_text("🎉 *" + items[idx]["name"] + "* исполнено!", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Нет такого номера.")
 
@@ -443,7 +612,7 @@ async def lie_detector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         verdict, pct_show = verdict_raw.format(pct=pct, anti=anti), pct
     bar = "🟩" * (pct_show // 10) + "⬜" * (10 - pct_show // 10)
     await update.message.reply_text(
-        f"{icon} *Детектор лжи*\n\n👤 {user}: _{text}_\n\n📊 {pct_show}%\n{bar}\n\n🔍 {verdict}",
+        icon + " *Детектор лжи*\n\n👤 " + user + ": _" + text + "_\n\n📊 " + str(pct_show) + "%\n" + bar + "\n\n🔍 " + verdict,
         parse_mode="Markdown"
     )
 
@@ -460,7 +629,7 @@ async def save_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phrase = " ".join(context.args)
     db["quotes"][key].append({"text": phrase, "by": update.effective_user.first_name})
     save_db(db)
-    await update.message.reply_text(f"💾 _«{phrase}»_", parse_mode="Markdown")
+    await update.message.reply_text("💾 _«" + phrase + "»_", parse_mode="Markdown")
 
 async def random_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_chat_key(update)
@@ -469,7 +638,7 @@ async def random_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quotes:
         return await update.message.reply_text("💬 Цитат нет. /save ваша фраза")
     q = random.choice(quotes)
-    await update.message.reply_text(f"💬 _«{q['text']}»_\n\n— {q['by']}", parse_mode="Markdown")
+    await update.message.reply_text("💬 _«" + q["text"] + "»_\n\n— " + q["by"], parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  🤖  ИИ
@@ -503,9 +672,9 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db["ai_history"][key] = history
         save_db(db)
         await thinking.delete()
-        await update.message.reply_text(f"🤖 {reply}")
+        await update.message.reply_text("🤖 " + reply)
     except Exception as e:
-        logger.error(f"Groq error: {e}")
+        logger.error("Groq error: %s", e)
         await update.message.reply_text("❌ ИИ недоступен. Попробуй позже.")
 
 async def reset_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -549,31 +718,44 @@ def main():
     app.add_handler(TypeHandler(Update, handle_business_message), group=-1)
 
     # Команды в личке с ботом
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("persona", set_persona))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("help",      start))
+    app.add_handler(CommandHandler("persona",   set_persona))
+    app.add_handler(CommandHandler("status",    status))
 
-    app.add_handler(CommandHandler("add", add_item))
-    app.add_handler(CommandHandler("list", show_list))
-    app.add_handler(CommandHandler("bought", bought_item))
+    app.add_handler(CommandHandler("deadlines", cmd_deadlines))  # 📚
 
-    app.add_handler(CommandHandler("wish", add_wish))
-    app.add_handler(CommandHandler("wishlist", show_wishlist))
-    app.add_handler(CommandHandler("done", done_wish))
+    app.add_handler(CommandHandler("add",       add_item))
+    app.add_handler(CommandHandler("list",      show_list))
+    app.add_handler(CommandHandler("bought",    bought_item))
 
-    app.add_handler(CommandHandler("check", lie_detector))
-    app.add_handler(CommandHandler("save", save_quote))
-    app.add_handler(CommandHandler("quote", random_quote))
+    app.add_handler(CommandHandler("wish",      add_wish))
+    app.add_handler(CommandHandler("wishlist",  show_wishlist))
+    app.add_handler(CommandHandler("done",      done_wish))
 
-    app.add_handler(CommandHandler("ai", ai_chat))
-    app.add_handler(CommandHandler("reset", reset_ai))
+    app.add_handler(CommandHandler("check",     lie_detector))
+    app.add_handler(CommandHandler("save",      save_quote))
+    app.add_handler(CommandHandler("quote",     random_quote))
+
+    app.add_handler(CommandHandler("ai",        ai_chat))
+    app.add_handler(CommandHandler("reset",     reset_ai))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
 
+    # 📅 Ежедневная рассылка дедлайнов
+    if DEADLINE_CHAT_ID:
+        tz_obj = pytz.timezone(DEADLINE_TZ)
+        send_time = datetime.now(tz_obj).replace(
+            hour=DEADLINE_HOUR, minute=DEADLINE_MINUTE, second=0, microsecond=0
+        ).timetz()
+        app.job_queue.run_daily(daily_deadlines_job, time=send_time)
+        logger.info("Рассылка дедлайнов: %02d:%02d %s → %s",
+                    DEADLINE_HOUR, DEADLINE_MINUTE, DEADLINE_TZ, DEADLINE_CHAT_ID)
+    else:
+        logger.warning("DEADLINE_CHAT_ID не задан — ежедневная рассылка отключена")
+
     logger.info("Business-бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 
 if __name__ == "__main__":
